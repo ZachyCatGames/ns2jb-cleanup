@@ -29,24 +29,40 @@ async function writeSparse(s, address, bytes) {
   }
 }
 
+// create thread via pthread_create and friends
+// base: argument ptr
+// limit: arg buffer size
+// slot: pthread struct offset
+// calls: presumeably a sequence of func calls to make
 async function start(s, base, limit, slot, calls, label, snapshot = 0) {
   check(base % 4096 === 0 && base >= s.base && base + limit <= s.base + s.bytes, 'Worker frame is outside allocation');
   check(slot % 8 === 0 && slot >= s.base && slot + 16 <= base, 'Worker output slot overlaps its frame');
+
   const plan = path.join(__dirname, label + '-plan.json'), filename = path.join(__dirname, label + '-frame.bin');
   await fs.writeFile(plan, JSON.stringify({base, sdk: live.sdk, calls}) + '\n');
   const {frame, proof} = build(base, live.sdk, calls, code);
   await fs.writeFile(filename, frame, {flag: 'wx', mode: 0o600});
   check(frame.length === proof.bytes && frame.length <= limit, 'Worker frame exceeds reserved space');
+
+  // 0 base
   await s.call('memset', base, 0, limit);
   await writeSparse(s, base, frame);
+
+  // just a check
   const hash = crypto.createHash('sha256').update(frame).digest('hex');
   check(await nativeHash(s, base, frame.length) === hash, 'Full worker frame hash differs');
+
   if (snapshot) {
     check(snapshot >= base + limit && snapshot + frame.length <= s.base + s.bytes, 'Worker snapshot is outside allocation');
+
+    // this function is memcpy
     await s.rpc.call3(live.sdk + 0x586fb0, snapshot, base, frame.length);
+
     check(await nativeHash(s, snapshot, frame.length) === hash, 'Worker snapshot differs');
   }
   await s.record({operation: 'workerPrepared', label, base, slot, ...proof, frameSha256: hash});
+
+
   return launch(s, {label, base, slot, calls, ...proof, snapshot, frameSha256: hash});
 }
 
@@ -55,9 +71,15 @@ async function launch(s, prepared) {
   await s.write(slot, Buffer.alloc(16));
   const pending = label + ':creating';
   s.threads.add(pending);
+
+  // call pthread_create base is arg
+  // longjmp will set
   const result = await s.rpc.call4(live.sdk + code.create.offset, slot, 0, live.sdk + code.longjmp.offset, base);
-  if (result) s.threads.delete(pending);
+  if (result)
+    s.threads.delete(pending);
   check(!result, 'pthread_create failed: ' + result);
+
+  // ThreadType pointer, add it to a thread list
   const thread = Number((await s.readOwned(slot, 8)).readBigUInt64LE());
   check(Number.isSafeInteger(thread) && thread > 0 && thread < 2 ** 39 && thread % 8 === 0, 'Invalid worker pointer');
   s.threads.delete(pending); s.threads.add(thread);

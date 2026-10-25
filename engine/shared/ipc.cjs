@@ -12,6 +12,7 @@ function descriptor({address, size, mode = 0}) {
   return bytes;
 }
 
+// create hipc packet
 function packet(command, input = Buffer.alloc(0), {pid = false, copies = [], send = [], receive = []} = {}) {
   if ([copies.length, send.length, receive.length].some(n => n > 15)) throw Error('Too many descriptors');
   const bytes = Buffer.alloc(256);

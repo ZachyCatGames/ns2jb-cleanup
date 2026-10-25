@@ -21,6 +21,8 @@ class Session {
   async record(entry) {
     await fs.appendFile(this.log, JSON.stringify({at: new Date().toISOString(), ...entry}) + '\n', {mode: 0o600});
   }
+
+
   async verifyCode(expected, label = 'SDK helper') {
     const address = live.sdk + expected.offset, size = expected.bytes.length / 2;
     const region = await this.rpc.query(address);
@@ -39,11 +41,21 @@ class Session {
     this.codeCache.code[expected.offset] = expected.bytes;
     await fs.writeFile(file, JSON.stringify(this.codeCache, null, 2) + '\n', {mode: 0o600});
   }
+
   async ready() {
     return live.platform === 2 && (await transport.request({command: 'status'})).ready;
   }
-  call(name, ...args) {return this.rpc.call3(live.sdk + functions[name].offset, ...args);}
-  read(address, bytes) {return this.rpc.read(address, bytes);}
+
+  // calls a function by name
+  call(name, ...args) {
+    return this.rpc.call3(live.sdk + functions[name].offset, ...args);
+  }
+
+  // read game memory
+  read(address, bytes) {
+    return this.rpc.read(address, bytes);
+  }
+
   // Callers must wait for any IPC operation touching this range to finish.
   async readOwned(address, bytes) {
     check(this.base && Number.isInteger(bytes) && bytes > 0 && bytes <= 524288 &&
@@ -51,6 +63,8 @@ class Session {
       'Owned read is outside the verified allocation');
     return this.rpc.read(address, bytes);
   }
+
+  // write to game memory
   write(address, bytes) {
     if (this.bulkUploads && bytes.length >= 4096 && this.base && address >= this.base &&
         address + bytes.length <= this.base + this.bytes) return require("./bulk-transfer.cjs").write(this, address, bytes);
@@ -82,6 +96,8 @@ class Session {
     await this.call('memset', this.base, 0, this.bytes);
     await this.record({operation: 'initialize', session: live.session, base: this.base, bytes: this.bytes});
   }
+
+  // open name
   async openService(name) {
     check(name.length > 0 && name.length <= 8, 'Invalid service name');
     const values = this.base + 0x1000;
@@ -94,6 +110,8 @@ class Session {
     this.handles.add(handle);
     return handle;
   }
+
+  // idk what handle is supposed to be, command appears to be a cmd id
   async ipc(label, handle, command, data = Buffer.alloc(0), options = {}) {
     await this.write(this.base, packet(command, data, options));
     const transport = await this.call('send', this.base, 4096, handle);

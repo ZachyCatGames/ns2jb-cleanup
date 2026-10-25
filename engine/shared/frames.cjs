@@ -44,27 +44,58 @@ function build(base, sdk, calls, code, fixed = false) {
     if (word < 0n || word > 0xffffffffffffffffn) throw Error('Worker word is outside uint64');
     frame.writeBigUInt64LE(word, offset);
   }
+
   put(0x10, base + tables); // x21: first dispatch table
   put(0x30, expanded[0].args[0]); // x25: first call's x0
-  put(0x58, sdk + code.loadTable.offset);
-  put(0x68, base + stack);
+  put(0x58, sdk + code.loadTable.offset); // addr branched to by longjmp
+  put(0x68, base + stack);  // sp is set to this
+
   expanded.forEach((call, index) => {
     if (!Number.isSafeInteger(call.function) || call.function % 4 ||
         call.function < sdk || call.function >= sdk + SDK_SIZE)
       throw Error('Worker function is outside the qualified SDK');
-    const table = tables + index * 0x100, sp = stack + index * STEP;
+
+    const table = tables + index * 0x100;
+    const sp = stack + index * STEP;
+
     put(table, base + table + 0x10);
     put(table + 0x78, call.function);
     put(RESULT + index * 8, SENTINEL);
+
+    // call4:
+    // x0 = x25
+    // x1 = x21
+    // x2 = x20
+    // x3 = x19
+    // x7 = 0
+    // loads x8 from x8+0x68
+    // blr x8
     put(sp + 8, sdk + code.call4.offset);
+
     [0x10, 0x20, 0x28].forEach((offset, argument) => put(sp + offset, call.args[argument + 1]));
+
+    // str x0, [x19]
+    // ldr x19, [sp, #0x10]
+    // ldp x29, x30, [sp], #0x20
+    // ret
     put(sp + 0xd8, sdk + code.saveResult64.offset);
+
     put(sp + 0x118, base + RESULT + index * 8);
     if (index + 1 < count) {
       put(sp + 0x108, base + tables + (index + 1) * 0x100);
       put(sp + 0xe8, expanded[index + 1].args[0]);
+
+      // ldr x8, [x21]
+      // add x0, x8, w20, UXTW
+      // ldp x20, x19, [sp, #0x20]
+      // ldr x21, [sp, #0x10]
+      // ldp x29, x30, [sp], #0x30
+      // ret
       put(sp + 0x128, sdk + code.loadTable.offset);
-    } else put(sp + 0x128, sdk + code.exit.offset);
+    } else {
+      // pthread_exit
+      put(sp + 0x128, sdk + code.exit.offset);
+    }
   });
   return {frame, proof: {bytes: size, logicalCalls: calls.length, nativeCalls: count,
     resultOffsets: expanded.map((_, index) => RESULT + index * 8), logicalResultIndices,

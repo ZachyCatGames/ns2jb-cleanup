@@ -1,18 +1,21 @@
 // CMIF domain/control framing. This module never contacts a console.
 const ipc = require('./ipc.cjs');
 
+// returns the start of the RawData section of a ipc msg (from bytes)
 function dataStart(bytes) {
   const first = bytes.readUInt32LE();
   const second = bytes.readUInt32LE(4);
   let at = 8;
+
+  // special bit
   if (second >>> 31) {
     const special = bytes.readUInt32LE(at);
     at += 4 + (special & 1 ? 8 : 0);
-    at += 4 * ((special >>> 1 & 15) + (special >>> 5 & 15));
+    at += 4 * ((special >>> 1 & 0xF) + (special >>> 5 & 0xF));
   }
-  at += (first >>> 16 & 15) * 8;
-  at += ((first >>> 20 & 15) + (first >>> 24 & 15) + (first >>> 28 & 15)) * 12;
-  return (at + 15) & ~15;
+  at += (first >>> 16 & 0xF) * 8;
+  at += ((first >>> 20 & 0xF) + (first >>> 24 & 0xF) + (first >>> 28 & 0xF)) * 12;
+  return (at + 15) & ~0xF;
 }
 
 function checkId(id) {
@@ -23,6 +26,8 @@ function checkContext(context) {
   if (!Number.isInteger(context) || context < 0 || context > 0xffffffff) throw Error('Invalid context');
 }
 
+// this calls Invoke2ManagerMethodOld / Invoke2ManagerMethod
+// context is passed as an arg for Invoke2ManagerMethod
 function control(command, input = Buffer.alloc(0), context = 0) {
   checkContext(context);
   const bytes = ipc.packet(command, input);

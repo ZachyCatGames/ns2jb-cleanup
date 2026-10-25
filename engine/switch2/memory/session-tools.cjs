@@ -36,6 +36,8 @@ function install(s, live, bulk) {
     };
   }
   s.metrics = counters;
+
+  // this function is purely used for timing function execution times for logging purposes
   s.measure = async (stage, work) => {
     const started = performance.now(), requests = counters.requests;
     let passed = false;

@@ -52,6 +52,7 @@ async function closeObject(s, domain, objectId) {
   check(!transport, 'Owned domain object did not close');
 }
 
+// Get IStorage size
 async function storageSize(s, handle) {
   const reply = await s.ipc('StorageGetSize', handle, 4);
   check(!reply.result, 'Storage GetSize failed');

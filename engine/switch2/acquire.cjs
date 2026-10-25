@@ -46,6 +46,9 @@ async function start() {
       }
       if (report?.memoryControl?.ready) break;
       if (exited || spawnError || Date.now() >= deadline)
+        console.log(exited);
+        console.log(spawnError);
+        //console.log(Date.now() >= deadline);
         throw Error('FS acquisition did not complete. Inspect ' + logFile + '; restart the console before another launch.');
       await delay(500);
     }
