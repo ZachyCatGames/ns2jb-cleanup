@@ -1,0 +1,15 @@
+it might be trying to do some bs with moving data into romfs cache to be read via
+IStorage::Read?
+
+storages comtains:
+    - a romfs storage handle
+
+wave seems to be the main exploit bs?
+wave profiles:
+    'abort-control'
+    'abort-hole-control'
+    several that begin with 'extent-'
+    'positive'
+    'binary-control'
+    'address-encoding-control'
+    several that begin with 'locate-'
